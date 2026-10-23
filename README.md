@@ -15,21 +15,14 @@ An Equicord and Vencord desktop plugin that automatically switches your screen s
 
 ## Installation
 
-### Via UserpluginInstaller
-
-1. Open Discord Settings -> Plugins and ensure UserpluginInstaller is enabled.
-2. In the UserpluginInstaller tab, paste:
-   ```
-   https://github.com/Lukk1a/activeScreen.desktop
-   ```
-3. Install and reload Discord (`Ctrl+R`).
-
-### Manual Clone
+Clone this repository into your client's `src/userplugins` folder and rebuild:
 
 ```bash
 git clone https://github.com/Lukk1a/activeScreen.desktop src/userplugins/activeScreen.desktop
 pnpm build
 ```
+
+Then reload Discord (`Ctrl+R`).
 
 ## Settings
 

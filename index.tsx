@@ -135,10 +135,10 @@ const settings = definePluginSettings({
 
 let pollInterval: number | undefined;
 let pendingSourceId: string | null = null;
-let switchTimeout: number | undefined;
-let toastTimeout: number | undefined;
+let pendingSourceName: string | null = null;
+let dwellStartTime = 0;
 let lastSwapTime = 0;
-let lastSwappedSourceId: string | null = null;
+let toastTimeout: number | undefined;
 
 const Native = VencordNative.pluginHelpers.ActiveScreen as PluginNative<
     typeof import("./native")
@@ -165,11 +165,9 @@ function toggle() {
     settings.store.autoSwitch = !settings.store.autoSwitch;
     showToggleToast();
     if (!settings.plain.autoSwitch) {
-        if (switchTimeout !== undefined) {
-            clearTimeout(switchTimeout);
-            switchTimeout = undefined;
-            pendingSourceId = null;
-        }
+        pendingSourceId = null;
+        pendingSourceName = null;
+        dwellStartTime = 0;
     }
 }
 
@@ -216,29 +214,36 @@ async function tick() {
     const active = await Native.getActiveScreenSource();
     if (!active) return;
 
-    if (active.sourceId === currentSourceId || active.sourceId === lastSwappedSourceId) {
-        if (switchTimeout !== undefined) {
-            clearTimeout(switchTimeout);
-            switchTimeout = undefined;
-            pendingSourceId = null;
-        }
+    if (active.sourceId === currentSourceId) {
+        pendingSourceId = null;
+        pendingSourceName = null;
+        dwellStartTime = 0;
         return;
     }
 
+    const now = Date.now();
+
     if (pendingSourceId !== active.sourceId) {
-        clearTimeout(switchTimeout);
         pendingSourceId = active.sourceId;
-
-        const elapsed = Date.now() - lastSwapTime;
-        const remainingCooldown = Math.max(0, MIN_SWAP_COOLDOWN - elapsed);
-        const delay = Math.max(settings.plain.delay, remainingCooldown);
-
-        switchTimeout = window.setTimeout(() => {
-            switchSource(active.sourceId, active.sourceName);
-            switchTimeout = undefined;
-            pendingSourceId = null;
-        }, delay);
+        pendingSourceName = active.sourceName;
+        dwellStartTime = now;
+        return;
     }
+
+    if (now - dwellStartTime < settings.plain.delay) {
+        return;
+    }
+
+    if (now - lastSwapTime < MIN_SWAP_COOLDOWN) {
+        return;
+    }
+
+    lastSwapTime = now;
+    pendingSourceId = null;
+    pendingSourceName = null;
+    dwellStartTime = 0;
+
+    switchSource(active.sourceId, active.sourceName);
 }
 
 function switchSource(sourceId: string, sourceName: string) {
@@ -247,9 +252,6 @@ function switchSource(sourceId: string, sourceName: string) {
 
     const { soundshareEnabled, resolution, fps } = ApplicationStreamingSettingsStore.getState();
     const previewDisabled = StreamPreviewSettings?.getSetting() ?? false;
-
-    lastSwapTime = Date.now();
-    lastSwappedSourceId = sourceId;
 
     startStream(stream.guildId ?? null, stream.channelId, {
         pid: null,
@@ -265,7 +267,7 @@ function switchSource(sourceId: string, sourceName: string) {
 
 function startPolling() {
     if (pollInterval !== undefined) return;
-    pollInterval = window.setInterval(tick, 350);
+    pollInterval = window.setInterval(tick, 200);
 }
 
 function stopPolling() {
@@ -273,12 +275,9 @@ function stopPolling() {
         clearInterval(pollInterval);
         pollInterval = undefined;
     }
-    if (switchTimeout !== undefined) {
-        clearTimeout(switchTimeout);
-        switchTimeout = undefined;
-    }
     pendingSourceId = null;
-    lastSwappedSourceId = null;
+    pendingSourceName = null;
+    dwellStartTime = 0;
 }
 
 function ActiveScreenIcon({ enabled = true, className }: { enabled?: boolean; className?: string; }) {

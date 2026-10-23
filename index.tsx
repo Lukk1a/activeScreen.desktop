@@ -24,7 +24,7 @@ const StreamPreviewSettings = getUserSettingLazy("voiceAndVideo", "disableStream
 
 const BUTTON_SETTINGS_KEYS: ("showButton" | "autoSwitch")[] = ["showButton", "autoSwitch"];
 const KEYBIND_SETTING_KEYS: ("shortcut")[] = ["shortcut"];
-const MIN_SWAP_COOLDOWN = 1500;
+const MIN_SWAP_COOLDOWN = 800;
 
 function KeybindRecorderSetting() {
     const { shortcut } = settings.use(KEYBIND_SETTING_KEYS);
@@ -98,6 +98,11 @@ const settings = definePluginSettings({
         description: "Automatically switch screens based on cursor position.",
         default: true
     },
+    invertScreens: {
+        type: OptionType.BOOLEAN,
+        description: "Invert screen mapping (swap which screen is selected).",
+        default: false
+    },
     showButton: {
         type: OptionType.BOOLEAN,
         description: "Show a toggle button next to mute/deafen in the user panel.",
@@ -111,8 +116,8 @@ const settings = definePluginSettings({
     delay: {
         type: OptionType.SLIDER,
         description: "Dwell time before switching screens in milliseconds.",
-        markers: [250, 500, 1000, 1500, 2000, 3000],
-        default: 1000,
+        markers: [250, 500, 750, 1000, 1500, 2000, 3000],
+        default: 600,
         stickToMarkers: false
     },
     onlyWhenStreamingScreen: {
@@ -134,6 +139,7 @@ const settings = definePluginSettings({
 });
 
 let pollInterval: number | undefined;
+let currentTargetSourceId: string | null = null;
 let pendingSourceId: string | null = null;
 let pendingSourceName: string | null = null;
 let dwellStartTime = 0;
@@ -204,17 +210,27 @@ async function tick() {
     if (!settings.plain.autoSwitch) return;
 
     const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
-    if (!stream) return;
+    if (!stream) {
+        currentTargetSourceId = null;
+        pendingSourceId = null;
+        dwellStartTime = 0;
+        return;
+    }
 
-    const currentSourceId = ApplicationStreamingStore.getStreamerActiveStreamMetadata()?.sourceId;
+    const streamerMeta = ApplicationStreamingStore.getStreamerActiveStreamMetadata();
+    const currentSourceId = streamerMeta?.sourceId ?? streamerMeta?.id;
     if (settings.plain.onlyWhenStreamingScreen && currentSourceId && !currentSourceId.startsWith("screen:")) {
         return;
     }
 
-    const active = await Native.getActiveScreenSource();
+    if (!currentTargetSourceId && currentSourceId) {
+        currentTargetSourceId = currentSourceId;
+    }
+
+    const active = await Native.getActiveScreenSource(settings.plain.invertScreens);
     if (!active) return;
 
-    if (active.sourceId === currentSourceId) {
+    if (active.sourceId === currentTargetSourceId) {
         pendingSourceId = null;
         pendingSourceName = null;
         dwellStartTime = 0;
@@ -239,6 +255,7 @@ async function tick() {
     }
 
     lastSwapTime = now;
+    currentTargetSourceId = active.sourceId;
     pendingSourceId = null;
     pendingSourceName = null;
     dwellStartTime = 0;
@@ -275,6 +292,7 @@ function stopPolling() {
         clearInterval(pollInterval);
         pollInterval = undefined;
     }
+    currentTargetSourceId = null;
     pendingSourceId = null;
     pendingSourceName = null;
     dwellStartTime = 0;
@@ -333,10 +351,12 @@ export default definePlugin({
     name: "ActiveScreen",
     description: "Automatically switches your screen share to the monitor containing your cursor.",
     tags: ["Media", "Voice", "Utility"],
-    authors: [{
-        name: "l1uka1",
-        id: 998585779804708864n
-    }],
+    authors: [
+        {
+            name: "l1uka1",
+            id: 998585779804708864n
+        }
+    ],
     settings,
 
     userAreaButton: {

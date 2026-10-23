@@ -22,8 +22,8 @@ import {
 const startStream = findByCodeLazy('type:"STREAM_START"');
 const StreamPreviewSettings = getUserSettingLazy("voiceAndVideo", "disableStreamPreviews");
 
-const BUTTON_SETTINGS_KEYS = ["showButton", "autoSwitch"] as const;
-const KEYBIND_SETTING_KEYS = ["shortcut"] as const;
+const BUTTON_SETTINGS_KEYS: ("showButton" | "autoSwitch")[] = ["showButton", "autoSwitch"];
+const KEYBIND_SETTING_KEYS: ("shortcut")[] = ["shortcut"];
 const MIN_SWAP_COOLDOWN = 1500;
 
 function KeybindRecorderSetting() {

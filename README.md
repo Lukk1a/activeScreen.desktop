@@ -32,11 +32,6 @@ Then reload Discord (`Ctrl+R`).
 - **delay:** Dwell time before switching screens (default: 1000ms).
 - **onlyWhenStreamingScreen:** Only switch when sharing a full display.
 - **shortcut:** Customizable shortcut to toggle the plugin.
-
-## Author
-
-- l1uka1 (Discord ID: `998585779804708864`)
-
 ## License
 
 GPL-3.0-or-later

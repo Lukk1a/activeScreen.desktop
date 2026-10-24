@@ -147,6 +147,10 @@ let dwellStartTime = 0;
 let lastSwapTime = 0;
 let toastTimeout: number | undefined;
 let isTicking = false;
+let noStreamTicks = 0;
+let lastAutoSwitch = settings.plain.autoSwitch;
+let lastInvertScreens = settings.plain.invertScreens;
+let lastOnlyWhenStreamingScreen = settings.plain.onlyWhenStreamingScreen;
 
 const Native = VencordNative.pluginHelpers.ActiveScreen as PluginNative<
     typeof import("./native")
@@ -209,6 +213,26 @@ function handleKeydown(e: KeyboardEvent) {
 }
 
 async function tick() {
+    // If settings changed while polling, immediately align state to prevent stale dwell or desync
+    if (settings.plain.autoSwitch !== lastAutoSwitch) {
+        lastAutoSwitch = settings.plain.autoSwitch;
+        pendingSourceId = null;
+        pendingSourceName = null;
+        dwellStartTime = 0;
+    }
+    if (settings.plain.invertScreens !== lastInvertScreens) {
+        lastInvertScreens = settings.plain.invertScreens;
+        pendingSourceId = null;
+        pendingSourceName = null;
+        dwellStartTime = 0;
+    }
+    if (settings.plain.onlyWhenStreamingScreen !== lastOnlyWhenStreamingScreen) {
+        lastOnlyWhenStreamingScreen = settings.plain.onlyWhenStreamingScreen;
+        pendingSourceId = null;
+        pendingSourceName = null;
+        dwellStartTime = 0;
+    }
+
     if (!settings.plain.autoSwitch || isTicking) return;
     isTicking = true;
 
@@ -220,12 +244,25 @@ async function tick() {
             pendingSourceId = null;
             pendingSourceName = null;
             dwellStartTime = 0;
+            noStreamTicks++;
+            if (noStreamTicks >= 10) {
+                stopPolling();
+            }
             return;
         }
+        noStreamTicks = 0;
 
         const streamerMeta = ApplicationStreamingStore.getStreamerActiveStreamMetadata();
         const currentSourceId = streamerMeta?.sourceId ?? streamerMeta?.id;
-        if (settings.plain.onlyWhenStreamingScreen && currentSourceId && !currentSourceId.startsWith("screen:")) {
+        const isScreenStream = Boolean(
+            currentSourceId?.startsWith("screen:") &&
+            (streamerMeta?.pid == null || streamerMeta?.pid === 0)
+        );
+
+        if (settings.plain.onlyWhenStreamingScreen && !isScreenStream) {
+            pendingSourceId = null;
+            pendingSourceName = null;
+            dwellStartTime = 0;
             return;
         }
 
@@ -247,6 +284,7 @@ async function tick() {
             }
         }
 
+        if (!Native?.getActiveScreenSource) return;
         const active = await Native.getActiveScreenSource(settings.plain.invertScreens);
 
         if (pollInterval === undefined || !settings.plain.autoSwitch) {
@@ -309,18 +347,23 @@ async function tick() {
 
 function switchSource(sourceId: string, sourceName: string) {
     try {
+        if (typeof startStream !== "function") return;
+
         const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
         if (!stream) return;
 
-        const { soundshareEnabled, resolution, fps } = ApplicationStreamingSettingsStore.getState();
-        const previewDisabled = StreamPreviewSettings?.getSetting() ?? false;
+        const state = ApplicationStreamingSettingsStore?.getState?.() ?? {};
+        const sound = state.soundshareEnabled ?? true;
+        const resolution = state.resolution ?? 720;
+        const fps = state.fps ?? 30;
+        const previewDisabled = StreamPreviewSettings?.getSetting?.() ?? false;
 
         startStream(stream.guildId ?? null, stream.channelId, {
             pid: null,
             sourceId,
             sourceName,
             audioSourceId: null,
-            sound: soundshareEnabled,
+            sound,
             previewDisabled,
             resolution,
             fps
@@ -331,6 +374,7 @@ function switchSource(sourceId: string, sourceName: string) {
 }
 
 function startPolling() {
+    noStreamTicks = 0;
     if (pollInterval !== undefined) return;
     pollInterval = window.setInterval(tick, 200);
 }
@@ -346,6 +390,7 @@ function stopPolling() {
     pendingSourceName = null;
     dwellStartTime = 0;
     isTicking = false;
+    noStreamTicks = 0;
 }
 
 function ActiveScreenIcon({ enabled = true, className }: { enabled?: boolean; className?: string; }) {
@@ -440,6 +485,17 @@ export default definePlugin({
         STREAM_DELETE(d: { streamKey: string }) {
             const userId = UserStore.getCurrentUser()?.id;
             if (userId && d.streamKey.endsWith(userId)) {
+                stopPolling();
+            }
+        },
+        STREAM_STOP(d: { streamKey?: string }) {
+            const userId = UserStore.getCurrentUser()?.id;
+            if (!d.streamKey || (userId && d.streamKey.endsWith(userId))) {
+                stopPolling();
+            }
+        },
+        VOICE_CHANNEL_SELECT(d: { channelId: string | null }) {
+            if (!d.channelId) {
                 stopPolling();
             }
         }

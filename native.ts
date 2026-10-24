@@ -9,14 +9,14 @@ import { desktopCapturer, IpcMainInvokeEvent, NativeImage, screen } from "electr
 
 interface WindowsScreenInfo {
     device: string;
-    screenNumber: number;
+    screenIndex: number;
     bounds: { x: number; y: number; width: number; height: number };
     isPrimary: boolean;
 }
 
 let cachedSources: { id: string; name: string; display_id: string; thumbnail: NativeImage }[] | null = null;
 let sourcesPromise: Promise<{ id: string; name: string; display_id: string; thumbnail: NativeImage }[]> | null = null;
-let lastDisplayCount = 0;
+let lastDisplayFingerprint = "";
 let initialized = false;
 let cachedWindowsScreens: WindowsScreenInfo[] | null = null;
 let isQueryingWindowsScreens = false;
@@ -30,11 +30,21 @@ function queryWindowsScreens() {
         return;
     }
     isQueryingWindowsScreens = true;
+    const queryVersion = cacheVersion;
 
-    const cmd = 'powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { $_.DeviceName + \':\' + $_.Bounds.X + \':\' + $_.Bounds.Y + \':\' + $_.Bounds.Width + \':\' + $_.Bounds.Height + \':\' + $_.Primary }"';
+    const cmd = 'powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { `$_.DeviceName + \':\' + `$_.Bounds.X + \':\' + `$_.Bounds.Y + \':\' + `$_.Bounds.Width + \':\' + `$_.Bounds.Height + \':\' + `$_.Primary }"';
 
     exec(cmd, { windowsHide: true, timeout: 5000 }, (err, stdout) => {
         isQueryingWindowsScreens = false;
+
+        // If an invalidation occurred while this query was in flight, discard and re-query if requested
+        if (queryVersion !== cacheVersion) {
+            if (hasPendingWindowsQuery) {
+                hasPendingWindowsQuery = false;
+                queryWindowsScreens();
+            }
+            return;
+        }
 
         if (hasPendingWindowsQuery) {
             hasPendingWindowsQuery = false;
@@ -45,11 +55,11 @@ function queryWindowsScreens() {
 
         const screens: WindowsScreenInfo[] = [];
         const lines = stdout.trim().split(/\r?\n/);
+        let screenIndex = 0;
         for (const line of lines) {
             const parts = line.trim().split(":");
             if (parts.length >= 6) {
                 const device = parts[0];
-                const screenNumber = parseInt(device.replace(/\D/g, "") || "1", 10);
                 const bounds = {
                     x: parseInt(parts[1], 10),
                     y: parseInt(parts[2], 10),
@@ -58,11 +68,12 @@ function queryWindowsScreens() {
                 };
                 const isPrimary = parts[5].toLowerCase() === "true";
                 if (!isNaN(bounds.x) && !isNaN(bounds.y) && !isNaN(bounds.width) && bounds.width > 0 && !isNaN(bounds.height) && bounds.height > 0) {
-                    screens.push({ device, screenNumber, bounds, isPrimary });
+                    screens.push({ device, screenIndex, bounds, isPrimary });
+                    screenIndex++;
                 }
             }
         }
-        if (screens.length > 0) {
+        if (screens.length > 0 && queryVersion === cacheVersion) {
             cachedWindowsScreens = screens;
         }
     });
@@ -71,31 +82,47 @@ function queryWindowsScreens() {
 function invalidate() {
     cacheVersion++;
     cachedSources = null;
+    cachedWindowsScreens = null;
+    lastDisplayFingerprint = "";
     queryWindowsScreens();
 }
 
 function initListeners() {
     if (initialized) return;
-    initialized = true;
-    screen.on("display-added", invalidate);
-    screen.on("display-removed", invalidate);
-    screen.on("display-metrics-changed", invalidate);
-    queryWindowsScreens();
+    try {
+        if (!screen || typeof screen.on !== "function") return;
+        initialized = true;
+        screen.on("display-added", invalidate);
+        screen.on("display-removed", invalidate);
+        screen.on("display-metrics-changed", invalidate);
+        queryWindowsScreens();
+    } catch {
+        // Safe fallback if screen API is not yet available at load time
+    }
 }
 
-// Proactively initialize screen queries on module load so cache is ready before first stream
-initListeners();
+// Proactively initialize screen queries on module load if screen is ready
+try {
+    initListeners();
+} catch {
+    // Handled in getActiveScreenSource
+}
+
+function getDisplayFingerprint(displays: Electron.Display[]) {
+    return displays.map(d => `${d.id}:${d.bounds.x}:${d.bounds.y}:${d.bounds.width}:${d.bounds.height}:${d.scaleFactor ?? 1}`).join(";");
+}
 
 async function getSources() {
-    const displays = screen.getAllDisplays();
-    if (cachedSources && displays.length === lastDisplayCount) {
+    const displays = screen.getAllDisplays().filter(d => d.bounds && d.bounds.width > 0 && d.bounds.height > 0);
+    const fingerprint = getDisplayFingerprint(displays);
+    if (cachedSources && fingerprint === lastDisplayFingerprint) {
         return cachedSources;
     }
     if (sourcesPromise) {
         return await sourcesPromise;
     }
     const currentVersion = cacheVersion;
-    lastDisplayCount = displays.length;
+    lastDisplayFingerprint = fingerprint;
     sourcesPromise = desktopCapturer.getSources({
         types: ["screen"],
         fetchWindowIcons: false,
@@ -117,11 +144,13 @@ export async function getActiveScreenSource(_: IpcMainInvokeEvent, invert = fals
     try {
         initListeners();
 
-        const displays = screen.getAllDisplays();
+        const displays = screen.getAllDisplays().filter(d => d.bounds && d.bounds.width > 0 && d.bounds.height > 0);
         if (displays.length <= 1) return null;
 
         const point = screen.getCursorScreenPoint();
         const display = screen.getDisplayNearestPoint(point);
+        if (!display || !display.bounds || display.bounds.width <= 0 || display.bounds.height <= 0) return null;
+
         const sources = await getSources();
         if (sources.length <= 1) return null;
 
@@ -164,7 +193,7 @@ export async function getActiveScreenSource(_: IpcMainInvokeEvent, invert = fals
 
         // 3. Windows system screen geometry matching (System.Windows.Forms.Screen)
         // Robust topology matching for identical resolutions on 3+ monitors, stacked monitors, negative coordinates, mixed DPI
-        if (!match && cachedWindowsScreens && cachedWindowsScreens.length > 0) {
+        if (!match && cachedWindowsScreens && cachedWindowsScreens.length === displays.length) {
             const primaryDisplay = screen.getPrimaryDisplay();
             const isDisplayPrimary = display.id === primaryDisplay.id ||
                 (display.bounds.x === 0 && display.bounds.y === 0);
@@ -208,23 +237,26 @@ export async function getActiveScreenSource(_: IpcMainInvokeEvent, invert = fals
             }
 
             if (matchedWinScreen) {
-                const targetScreenNum = matchedWinScreen.screenNumber;
+                const targetIdx = matchedWinScreen.screenIndex;
 
-                // Match by screen number extracted from source name
-                match = sources.find(s => {
-                    const m = s.name.match(/\b(\d+)\b/) ?? s.name.match(/(\d+)/);
-                    return m ? parseInt(m[1], 10) === targetScreenNum : false;
-                });
-
-                // Match by screen index in source id (e.g. "screen:0:0" for Screen 1)
-                if (!match) {
-                    const screenIdxStr = (targetScreenNum - 1).toString();
-                    match = sources.find(s => s.id === `screen:${screenIdxStr}:0` || s.id === `screen:${screenIdxStr}`);
+                // Match by exact Chromium source index in sources array (AllScreens and EnumDisplayMonitors order)
+                if (targetIdx >= 0 && targetIdx < sources.length) {
+                    match = sources[targetIdx];
                 }
 
-                // Match by target screen index position in sources array
-                if (!match && targetScreenNum >= 1 && targetScreenNum <= sources.length) {
-                    match = sources[targetScreenNum - 1];
+                // Match by screen index in source id (e.g. "screen:0:0" for index 0)
+                if (!match) {
+                    const idxStr = targetIdx.toString();
+                    match = sources.find(s => s.id === `screen:${idxStr}:0` || s.id === `screen:${idxStr}`);
+                }
+
+                // Match by 1-based screen number in source name (e.g. "Screen 1" for index 0)
+                if (!match) {
+                    const numStr = (targetIdx + 1).toString();
+                    match = sources.find(s => {
+                        const m = s.name.match(/\b(\d+)\b/) ?? s.name.match(/(\d+)/);
+                        return m ? m[1] === numStr : false;
+                    });
                 }
             }
         }
@@ -235,22 +267,27 @@ export async function getActiveScreenSource(_: IpcMainInvokeEvent, invert = fals
             const isPrimary = display.id === primaryDisplay.id || (display.bounds.x === 0 && display.bounds.y === 0);
 
             if (isPrimary) {
-                match = sources.find(s => {
-                    const m = s.name.match(/\b(\d+)\b/);
-                    return m ? parseInt(m[1], 10) === 1 : false;
-                }) ?? sources.find(s => s.id === "screen:0:0" || s.id === "screen:0") ?? sources[0];
+                match = sources.find(s => s.id === "screen:0:0" || s.id === "screen:0") ??
+                        sources.find(s => {
+                            const m = s.name.match(/\b(\d+)\b/);
+                            return m ? parseInt(m[1], 10) === 1 : false;
+                        }) ?? sources[0];
             } else if (displays.length === 2 && sources.length === 2) {
-                match = sources.find(s => {
-                    const m = s.name.match(/\b(\d+)\b/);
-                    return m ? parseInt(m[1], 10) === 2 : false;
-                }) ?? sources.find(s => s.id === "screen:1:0" || s.id === "screen:1") ?? sources[1];
+                match = sources.find(s => s.id === "screen:1:0" || s.id === "screen:1") ??
+                        sources.find(s => {
+                            const m = s.name.match(/\b(\d+)\b/);
+                            return m ? parseInt(m[1], 10) === 2 : false;
+                        }) ?? sources[1];
             } else {
-                const sortedDisplays = [...displays].sort((a, b) =>
-                    a.bounds.x !== b.bounds.x ? a.bounds.x - b.bounds.x : a.bounds.y - b.bounds.y
-                );
-                const displayIndex = sortedDisplays.findIndex(d => d.id === display.id);
-                if (displayIndex !== -1 && sources[displayIndex]) {
-                    match = sources[displayIndex];
+                // Non-primary displays sorted spatially, mapped to secondary sources (sources[1], sources[2], ...)
+                const nonPrimaryDisplays = displays
+                    .filter(d => d.id !== primaryDisplay.id && !(d.bounds.x === 0 && d.bounds.y === 0))
+                    .sort((a, b) => (a.bounds.x !== b.bounds.x ? a.bounds.x - b.bounds.x : a.bounds.y - b.bounds.y));
+                const secondarySources = sources.slice(1);
+
+                const nonPrimaryIdx = nonPrimaryDisplays.findIndex(d => d.id === display.id);
+                if (nonPrimaryIdx !== -1 && secondarySources[nonPrimaryIdx]) {
+                    match = secondarySources[nonPrimaryIdx];
                 }
             }
         }

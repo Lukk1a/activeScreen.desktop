@@ -148,6 +148,7 @@ let lastSwapTime = 0;
 let toastTimeout: number | undefined;
 let isTicking = false;
 let noStreamTicks = 0;
+let nullActiveTicks = 0;
 let pollSession = 0;
 let lastAutoSwitch = settings.plain.autoSwitch;
 let lastInvertScreens = settings.plain.invertScreens;
@@ -204,7 +205,10 @@ function matchesShortcut(e: KeyboardEvent, shortcut: string): boolean {
 
 function handleKeydown(e: KeyboardEvent) {
     if (e.repeat) return;
-    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || (e.target as HTMLElement | null)?.isContentEditable) {
+    if (e.target instanceof HTMLInputElement ||
+        e.target instanceof HTMLTextAreaElement ||
+        (e.target as HTMLElement | null)?.isContentEditable ||
+        (e.target as HTMLElement | null)?.closest?.('input, textarea, [contenteditable="true"], [role="textbox"], [data-slate-editor]')) {
         return;
     }
 
@@ -300,11 +304,15 @@ async function tick() {
         }
 
         if (!active) {
-            pendingSourceId = null;
-            pendingSourceName = null;
-            dwellStartTime = 0;
+            nullActiveTicks++;
+            if (nullActiveTicks >= 2) {
+                pendingSourceId = null;
+                pendingSourceName = null;
+                dwellStartTime = 0;
+            }
             return;
         }
+        nullActiveTicks = 0;
 
         if (!currentTargetSourceId) {
             currentTargetSourceId = (currentSourceId && currentSourceId.startsWith("screen:"))
@@ -360,11 +368,12 @@ function switchSource(sourceId: string, sourceName: string) {
         const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
         if (!stream) return;
 
+        const streamerMeta = ApplicationStreamingStore?.getStreamerActiveStreamMetadata?.();
         const state = ApplicationStreamingSettingsStore?.getState?.() ?? {};
         const sound = state.soundshareEnabled ?? true;
         const resolution = state.resolution ?? 720;
         const fps = state.fps ?? 30;
-        const previewDisabled = StreamPreviewSettings?.getSetting?.() ?? false;
+        const previewDisabled = streamerMeta?.previewDisabled ?? StreamPreviewSettings?.getSetting?.() ?? false;
 
         startStream(stream.guildId ?? null, stream.channelId, {
             pid: null,
@@ -383,6 +392,7 @@ function switchSource(sourceId: string, sourceName: string) {
 
 function startPolling() {
     noStreamTicks = 0;
+    nullActiveTicks = 0;
     pollSession++;
     if (pollInterval !== undefined) return;
     pollInterval = window.setInterval(tick, 200);
@@ -401,6 +411,7 @@ function stopPolling() {
     dwellStartTime = 0;
     isTicking = false;
     noStreamTicks = 0;
+    nullActiveTicks = 0;
 }
 
 function ActiveScreenIcon({ enabled = true, className }: { enabled?: boolean; className?: string; }) {
@@ -456,12 +467,10 @@ export default definePlugin({
     name: "ActiveScreen",
     description: "Automatically switches your screen share to the monitor containing your cursor.",
     tags: ["Media", "Voice", "Utility"],
-    authors: [
-        {
-            name: "l1uka1",
-            id: 998585779804708864n
-        }
-    ],
+    authors: [{
+        name: "l1uka1",
+        id: 998585779804708864n
+    }],
     settings,
 
     userAreaButton: {
@@ -495,12 +504,14 @@ export default definePlugin({
         STREAM_DELETE(d: { streamKey: string }) {
             const userId = UserStore?.getCurrentUser?.()?.id;
             if (!d.streamKey || (userId && d.streamKey.endsWith(userId))) {
+                if (Date.now() - lastSwapTime < 2500) return;
                 stopPolling();
             }
         },
         STREAM_STOP(d: { streamKey?: string }) {
             const userId = UserStore?.getCurrentUser?.()?.id;
             if (!d.streamKey || (userId && d.streamKey.endsWith(userId))) {
+                if (Date.now() - lastSwapTime < 2500) return;
                 stopPolling();
             }
         },

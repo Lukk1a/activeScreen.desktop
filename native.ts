@@ -19,71 +19,86 @@ let sourcesPromise: Promise<{ id: string; name: string; display_id: string; thum
 let lastDisplayFingerprint = "";
 let initialized = false;
 let cachedWindowsScreens: WindowsScreenInfo[] | null = null;
+let windowsScreensPromise: Promise<WindowsScreenInfo[] | null> | null = null;
 let isQueryingWindowsScreens = false;
 let hasPendingWindowsQuery = false;
 let cacheVersion = 0;
 
-function queryWindowsScreens() {
-    if (process.platform !== "win32") return;
+function queryWindowsScreens(): Promise<WindowsScreenInfo[] | null> {
+    if (process.platform !== "win32") {
+        return Promise.resolve(null);
+    }
+
     if (isQueryingWindowsScreens) {
         hasPendingWindowsQuery = true;
-        return;
+        return windowsScreensPromise ?? Promise.resolve(cachedWindowsScreens);
     }
+
     isQueryingWindowsScreens = true;
     const queryVersion = cacheVersion;
 
-    const cmd = 'powershell -NoProfile -NonInteractive -WindowStyle Hidden -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { `$_.DeviceName + \':\' + `$_.Bounds.X + \':\' + `$_.Bounds.Y + \':\' + `$_.Bounds.Width + \':\' + `$_.Bounds.Height + \':\' + `$_.Primary }"';
+    const cmd = 'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { `$_.DeviceName + \':\' + `$_.Bounds.X + \':\' + `$_.Bounds.Y + \':\' + `$_.Bounds.Width + \':\' + `$_.Bounds.Height + \':\' + `$_.Primary }"';
 
-    exec(cmd, { windowsHide: true, timeout: 5000 }, (err, stdout) => {
-        isQueryingWindowsScreens = false;
+    windowsScreensPromise = new Promise(resolve => {
+        exec(cmd, { windowsHide: true, timeout: 5000 }, (err, stdout) => {
+            isQueryingWindowsScreens = false;
 
-        // If an invalidation occurred while this query was in flight, discard and re-query if requested
-        if (queryVersion !== cacheVersion) {
+            if (queryVersion !== cacheVersion) {
+                if (hasPendingWindowsQuery) {
+                    hasPendingWindowsQuery = false;
+                    resolve(queryWindowsScreens());
+                    return;
+                }
+                resolve(cachedWindowsScreens);
+                return;
+            }
+
             if (hasPendingWindowsQuery) {
                 hasPendingWindowsQuery = false;
                 queryWindowsScreens();
             }
-            return;
-        }
 
-        if (hasPendingWindowsQuery) {
-            hasPendingWindowsQuery = false;
-            queryWindowsScreens();
-        }
+            if (err || !stdout) {
+                resolve(cachedWindowsScreens);
+                return;
+            }
 
-        if (err || !stdout) return;
-
-        const screens: WindowsScreenInfo[] = [];
-        const lines = stdout.trim().split(/\r?\n/);
-        let screenIndex = 0;
-        for (const line of lines) {
-            const parts = line.trim().split(":");
-            if (parts.length >= 6) {
-                const device = parts[0];
-                const bounds = {
-                    x: parseInt(parts[1], 10),
-                    y: parseInt(parts[2], 10),
-                    width: parseInt(parts[3], 10),
-                    height: parseInt(parts[4], 10)
-                };
-                const isPrimary = parts[5].toLowerCase() === "true";
-                if (!isNaN(bounds.x) && !isNaN(bounds.y) && !isNaN(bounds.width) && bounds.width > 0 && !isNaN(bounds.height) && bounds.height > 0) {
-                    screens.push({ device, screenIndex, bounds, isPrimary });
-                    screenIndex++;
+            const screens: WindowsScreenInfo[] = [];
+            const lines = stdout.trim().split(/\r?\n/);
+            let screenIndex = 0;
+            for (const line of lines) {
+                const parts = line.trim().split(":");
+                if (parts.length >= 6) {
+                    const device = parts[0];
+                    const bounds = {
+                        x: parseInt(parts[1], 10),
+                        y: parseInt(parts[2], 10),
+                        width: parseInt(parts[3], 10),
+                        height: parseInt(parts[4], 10)
+                    };
+                    const isPrimary = parts[5].toLowerCase() === "true";
+                    if (!isNaN(bounds.x) && !isNaN(bounds.y) && !isNaN(bounds.width) && bounds.width > 0 && !isNaN(bounds.height) && bounds.height > 0) {
+                        screens.push({ device, screenIndex, bounds, isPrimary });
+                        screenIndex++;
+                    }
                 }
             }
-        }
-        if (screens.length > 0 && queryVersion === cacheVersion) {
-            cachedWindowsScreens = screens;
-        }
+
+            if (screens.length > 0 && queryVersion === cacheVersion) {
+                cachedWindowsScreens = screens;
+            }
+            resolve(cachedWindowsScreens);
+        });
     });
+
+    return windowsScreensPromise;
 }
 
 function invalidate() {
     cacheVersion++;
     cachedSources = null;
-    cachedWindowsScreens = null;
     lastDisplayFingerprint = "";
+    // Keep cachedWindowsScreens intact while refreshing to avoid any null gap
     queryWindowsScreens();
 }
 
@@ -151,6 +166,14 @@ export async function getActiveScreenSource(_: IpcMainInvokeEvent, invert = fals
         const display = screen.getDisplayNearestPoint(point);
         if (!display || !display.bounds || display.bounds.width <= 0 || display.bounds.height <= 0) return null;
 
+        // Ensure Windows monitor cache is ready if running on Windows
+        if (process.platform === "win32" && !cachedWindowsScreens && windowsScreensPromise) {
+            await Promise.race([
+                windowsScreensPromise,
+                new Promise(resolve => setTimeout(resolve, 1200))
+            ]);
+        }
+
         const sources = await getSources();
         if (sources.length <= 1) return null;
 
@@ -175,7 +198,7 @@ export async function getActiveScreenSource(_: IpcMainInvokeEvent, invert = fals
                 let bestDiff = Infinity;
                 let bestSource: typeof sources[0] | null = null;
                 for (const s of sources) {
-                    const size = s.thumbnail.getSize();
+                    const size = s.thumbnail?.getSize?.() ?? { width: 0, height: 0 };
                     if (size.width && size.height) {
                         const aspect = size.width / size.height;
                         const diff = Math.abs(aspect - displayAspect);
@@ -193,7 +216,7 @@ export async function getActiveScreenSource(_: IpcMainInvokeEvent, invert = fals
 
         // 3. Windows system screen geometry matching (System.Windows.Forms.Screen)
         // Robust topology matching for identical resolutions on 3+ monitors, stacked monitors, negative coordinates, mixed DPI
-        if (!match && cachedWindowsScreens && cachedWindowsScreens.length === displays.length) {
+        if (!match && cachedWindowsScreens && cachedWindowsScreens.length > 0) {
             const primaryDisplay = screen.getPrimaryDisplay();
             const isDisplayPrimary = display.id === primaryDisplay.id ||
                 (display.bounds.x === 0 && display.bounds.y === 0);
@@ -302,7 +325,7 @@ export async function getActiveScreenSource(_: IpcMainInvokeEvent, invert = fals
             const currentMatchId = match.id;
             const idx = sources.findIndex(s => s.id === currentMatchId);
             if (idx !== -1) {
-                match = sources[sources.length - 1 - idx];
+                match = sources[(idx + 1) % sources.length];
             } else {
                 const other = sources.find(s => s.id !== currentMatchId);
                 if (other) match = other;

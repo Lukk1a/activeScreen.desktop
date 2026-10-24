@@ -56,7 +56,6 @@ function queryWindowsScreens() {
 
 function invalidate() {
     cachedSources = null;
-    cachedWindowsScreens = null;
     queryWindowsScreens();
 }
 
@@ -68,6 +67,9 @@ function initListeners() {
     screen.on("display-metrics-changed", invalidate);
     queryWindowsScreens();
 }
+
+// Proactively initialize screen queries on module load so cache is ready before first stream
+initListeners();
 
 async function getSources() {
     const displays = screen.getAllDisplays();
@@ -110,86 +112,118 @@ export async function getActiveScreenSource(_: IpcMainInvokeEvent, invert = fals
         // 1. Direct display_id match
         let match = sources.find(s => Boolean(s.display_id) && s.display_id === displayIdStr);
 
-        // 1b. Direct screen:<id>:0 match if display.id is large unique ID
+        // 1b. Direct screen:<id>:0 match
         if (!match && display.id > 1000) {
-            match = sources.find(s => s.id === `screen:${displayIdStr}:0`);
+            match = sources.find(s => s.id === `screen:${displayIdStr}:0` || s.id === `screen:${displayIdStr}`);
         }
 
-        // 2. Windows system screen geometry matching
-        if (!match && cachedWindowsScreens && cachedWindowsScreens.length > 0) {
-            const scale = display.scaleFactor || 1;
-            const displayCenterX = (display.bounds.x + display.bounds.width / 2) * scale;
-            const displayCenterY = (display.bounds.y + display.bounds.height / 2) * scale;
+        // 2. Aspect ratio signature matching (instant thumbnail analysis, no external process)
+        // Highly accurate for mixed orientation (1 portrait + 1 landscape), ultrawide + 16:9, etc.
+        if (!match && sources.length === displays.length) {
+            const displayAspect = display.bounds.width / (display.bounds.height || 1);
+            const displayAspects = displays.map(d => d.bounds.width / (d.bounds.height || 1));
+            const isUniqueAspect = displayAspects.filter(a => Math.abs(a - displayAspect) < 0.08).length === 1;
 
-            let bestDist = Infinity;
+            if (isUniqueAspect) {
+                let bestDiff = Infinity;
+                let bestSource: typeof sources[0] | null = null;
+                for (const s of sources) {
+                    const size = s.thumbnail.getSize();
+                    if (size.width && size.height) {
+                        const aspect = size.width / size.height;
+                        const diff = Math.abs(aspect - displayAspect);
+                        if (diff < bestDiff) {
+                            bestDiff = diff;
+                            bestSource = s;
+                        }
+                    }
+                }
+                if (bestDiff < 0.08 && bestSource) {
+                    match = bestSource;
+                }
+            }
+        }
+
+        // 3. Windows system screen geometry matching (System.Windows.Forms.Screen)
+        if (!match && cachedWindowsScreens && cachedWindowsScreens.length > 0) {
+            const primaryDisplay = screen.getPrimaryDisplay();
             let matchedWinScreen: WindowsScreenInfo | null = null;
 
-            for (const ws of cachedWindowsScreens) {
-                const wsCenterX = ws.bounds.x + ws.bounds.width / 2;
-                const wsCenterY = ws.bounds.y + ws.bounds.height / 2;
-                const dist = Math.hypot(wsCenterX - displayCenterX, wsCenterY - displayCenterY);
-                if (dist < bestDist) {
-                    bestDist = dist;
-                    matchedWinScreen = ws;
+            // 3a. Primary display matching
+            if (display.id === primaryDisplay.id || (display.bounds.x === 0 && display.bounds.y === 0)) {
+                matchedWinScreen = cachedWindowsScreens.find(ws => ws.isPrimary) ?? null;
+            }
+
+            // 3b. Relative coordinate direction from Primary
+            if (!matchedWinScreen) {
+                const primaryWs = cachedWindowsScreens.find(ws => ws.isPrimary);
+                if (primaryWs) {
+                    const dipDx = display.bounds.x - primaryDisplay.bounds.x;
+                    const dipDy = display.bounds.y - primaryDisplay.bounds.y;
+
+                    matchedWinScreen = cachedWindowsScreens.find(ws => {
+                        if (ws.isPrimary) return false;
+                        const physDx = ws.bounds.x - primaryWs.bounds.x;
+                        const physDy = ws.bounds.y - primaryWs.bounds.y;
+
+                        const xMatch = (dipDx === 0 && physDx === 0) ||
+                                       (dipDx > 0 && physDx > 0) ||
+                                       (dipDx < 0 && physDx < 0);
+                        const yMatch = (dipDy === 0 && physDy === 0) ||
+                                       (dipDy > 0 && physDy > 0) ||
+                                       (dipDy < 0 && physDy < 0);
+
+                        return xMatch && yMatch;
+                    }) ?? null;
+                }
+            }
+
+            // 3c. Closest center distance fallback
+            if (!matchedWinScreen) {
+                let bestDist = Infinity;
+                for (const ws of cachedWindowsScreens) {
+                    const dist = Math.hypot(
+                        (display.bounds.x + display.bounds.width / 2) - (ws.bounds.x + ws.bounds.width / 2),
+                        (display.bounds.y + display.bounds.height / 2) - (ws.bounds.y + ws.bounds.height / 2)
+                    );
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        matchedWinScreen = ws;
+                    }
                 }
             }
 
             if (matchedWinScreen) {
                 const targetScreenNum = matchedWinScreen.screenNumber;
                 match = sources.find(s => {
-                    const numFromName = parseInt(s.name.replace(/\D/g, "") || "-1", 10);
-                    if (numFromName === targetScreenNum) return true;
-                    const parts = s.id.split(":");
-                    if (parts.length >= 2) {
-                        const numFromId = parseInt(parts[1], 10);
-                        if (numFromId === targetScreenNum - 1) return true;
-                    }
-                    return false;
+                    const m = s.name.match(/(?:screen|écran|pantalla|bildschirm|display)?\s*(\d+)/i);
+                    return m ? parseInt(m[1], 10) === targetScreenNum : false;
                 });
-            }
-        }
-
-        // 3. Orientation signature (Mixed portrait/landscape)
-        if (!match && sources.length === displays.length) {
-            const isPortraitDisplay = display.bounds.height > display.bounds.width;
-            const portraitDisplays = displays.filter(d => d.bounds && d.bounds.height > d.bounds.width);
-            const portraitSources = sources.filter(s => {
-                const size = s.thumbnail.getSize();
-                return size.height > size.width;
-            });
-
-            if (portraitDisplays.length > 0 && portraitDisplays.length < displays.length && portraitDisplays.length === portraitSources.length) {
-                if (isPortraitDisplay && portraitDisplays.length === 1) {
-                    match = portraitSources[0];
-                } else if (!isPortraitDisplay && sources.length - portraitDisplays.length === 1) {
-                    match = sources.find(s => !portraitSources.includes(s));
+                if (!match && targetScreenNum >= 1 && targetScreenNum <= sources.length) {
+                    match = sources[targetScreenNum - 1];
                 }
             }
         }
 
-        // 4. Unique aspect ratio signature
+        // 4. Primary vs Secondary index matching fallback
         if (!match && sources.length === displays.length) {
-            const displayAspect = display.bounds.width / (display.bounds.height || 1);
-            const matchingSources = sources.filter(s => {
-                const size = s.thumbnail.getSize();
-                if (!size.width || !size.height) return false;
-                const aspect = size.width / size.height;
-                return Math.abs(aspect - displayAspect) < 0.08;
-            });
-
-            if (matchingSources.length === 1) {
-                match = matchingSources[0];
+            const primaryDisplay = screen.getPrimaryDisplay();
+            const isPrimary = display.id === primaryDisplay.id || (display.bounds.x === 0 && display.bounds.y === 0);
+            if (isPrimary && sources[0]) {
+                match = sources[0];
+            } else if (!isPrimary && sources.length === 2 && sources[1]) {
+                match = sources[1];
+            } else {
+                const displayIndex = displays.findIndex(d => d.id === display.id);
+                if (displayIndex !== -1 && sources[displayIndex]) {
+                    match = sources[displayIndex];
+                }
             }
         }
 
-        // 5. Index fallback
+        // 5. Fallback to first source
         if (!match) {
-            const displayIndex = displays.findIndex(d => d.id === display.id);
-            if (displayIndex !== -1 && sources[displayIndex]) {
-                match = sources[displayIndex];
-            } else {
-                match = sources[0];
-            }
+            match = sources[0];
         }
 
         // 6. User invert setting override

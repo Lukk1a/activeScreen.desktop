@@ -140,6 +140,7 @@ const settings = definePluginSettings({
 
 let pollInterval: number | undefined;
 let currentTargetSourceId: string | null = null;
+let lastSwappedSourceId: string | null = null;
 let pendingSourceId: string | null = null;
 let pendingSourceName: string | null = null;
 let dwellStartTime = 0;
@@ -215,6 +216,7 @@ async function tick() {
         const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
         if (!stream) {
             currentTargetSourceId = null;
+            lastSwappedSourceId = null;
             pendingSourceId = null;
             pendingSourceName = null;
             dwellStartTime = 0;
@@ -229,8 +231,18 @@ async function tick() {
 
         const now = Date.now();
 
-        if (currentSourceId && currentSourceId.startsWith("screen:") && now - lastSwapTime > MIN_SWAP_COOLDOWN) {
-            if (!currentTargetSourceId || (currentTargetSourceId !== currentSourceId && !pendingSourceId)) {
+        // Synchronize external changes made directly in Discord's UI:
+        // Discord's WebRTC stream renegotiation takes 500-1500ms to update metadata after a swap.
+        // Therefore, we only accept an external source change if we have no active target yet,
+        // or after stream has stabilized (> 2000ms after last swap) where Discord reports
+        // a source that is neither our current target nor the source we just swapped to.
+        if (currentSourceId && currentSourceId.startsWith("screen:")) {
+            if (!currentTargetSourceId) {
+                currentTargetSourceId = currentSourceId;
+            } else if (now - lastSwapTime > 2000 &&
+                       currentSourceId !== currentTargetSourceId &&
+                       currentSourceId !== lastSwappedSourceId &&
+                       !pendingSourceId) {
                 currentTargetSourceId = currentSourceId;
             }
         }
@@ -249,9 +261,12 @@ async function tick() {
         }
 
         if (!currentTargetSourceId) {
-            currentTargetSourceId = currentSourceId || active.sourceId;
+            currentTargetSourceId = (currentSourceId && currentSourceId.startsWith("screen:"))
+                ? currentSourceId
+                : active.sourceId;
         }
 
+        // If cursor is already on the screen being streamed, reset pending dwell
         if (active.sourceId === currentTargetSourceId) {
             pendingSourceId = null;
             pendingSourceName = null;
@@ -259,6 +274,7 @@ async function tick() {
             return;
         }
 
+        // Cursor moved to a new screen
         if (pendingSourceId !== active.sourceId) {
             pendingSourceId = active.sourceId;
             pendingSourceName = active.sourceName;
@@ -266,15 +282,18 @@ async function tick() {
             return;
         }
 
+        // Check if dwell time threshold is reached
         if (now - dwellStartTime < settings.plain.delay) {
             return;
         }
 
+        // Check swap cooldown
         if (now - lastSwapTime < MIN_SWAP_COOLDOWN) {
             return;
         }
 
         lastSwapTime = now;
+        lastSwappedSourceId = active.sourceId;
         currentTargetSourceId = active.sourceId;
         pendingSourceId = null;
         pendingSourceName = null;
@@ -289,22 +308,26 @@ async function tick() {
 }
 
 function switchSource(sourceId: string, sourceName: string) {
-    const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
-    if (!stream) return;
+    try {
+        const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
+        if (!stream) return;
 
-    const { soundshareEnabled, resolution, fps } = ApplicationStreamingSettingsStore.getState();
-    const previewDisabled = StreamPreviewSettings?.getSetting() ?? false;
+        const { soundshareEnabled, resolution, fps } = ApplicationStreamingSettingsStore.getState();
+        const previewDisabled = StreamPreviewSettings?.getSetting() ?? false;
 
-    startStream(stream.guildId ?? null, stream.channelId, {
-        pid: null,
-        sourceId,
-        sourceName,
-        audioSourceId: null,
-        sound: soundshareEnabled,
-        previewDisabled,
-        resolution,
-        fps
-    });
+        startStream(stream.guildId ?? null, stream.channelId, {
+            pid: null,
+            sourceId,
+            sourceName,
+            audioSourceId: null,
+            sound: soundshareEnabled,
+            previewDisabled,
+            resolution,
+            fps
+        });
+    } catch {
+        // Prevent stream swap exceptions from crashing
+    }
 }
 
 function startPolling() {
@@ -318,6 +341,7 @@ function stopPolling() {
         pollInterval = undefined;
     }
     currentTargetSourceId = null;
+    lastSwappedSourceId = null;
     pendingSourceId = null;
     pendingSourceName = null;
     dwellStartTime = 0;

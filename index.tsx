@@ -145,6 +145,7 @@ let pendingSourceName: string | null = null;
 let dwellStartTime = 0;
 let lastSwapTime = 0;
 let toastTimeout: number | undefined;
+let isTicking = false;
 
 const Native = VencordNative.pluginHelpers.ActiveScreen as PluginNative<
     typeof import("./native")
@@ -178,7 +179,7 @@ function toggle() {
 }
 
 function matchesShortcut(e: KeyboardEvent, shortcut: string): boolean {
-    const parts = shortcut.toUpperCase().split("+");
+    const parts = shortcut.toUpperCase().split("+").map(p => p.trim());
     const needCtrl = parts.includes("CTRL");
     const needShift = parts.includes("SHIFT");
     const needAlt = parts.includes("ALT");
@@ -207,60 +208,84 @@ function handleKeydown(e: KeyboardEvent) {
 }
 
 async function tick() {
-    if (!settings.plain.autoSwitch) return;
+    if (!settings.plain.autoSwitch || isTicking) return;
+    isTicking = true;
 
-    const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
-    if (!stream) {
-        currentTargetSourceId = null;
-        pendingSourceId = null;
-        dwellStartTime = 0;
-        return;
-    }
+    try {
+        const stream = ApplicationStreamingStore.getCurrentUserActiveStream();
+        if (!stream) {
+            currentTargetSourceId = null;
+            pendingSourceId = null;
+            pendingSourceName = null;
+            dwellStartTime = 0;
+            return;
+        }
 
-    const streamerMeta = ApplicationStreamingStore.getStreamerActiveStreamMetadata();
-    const currentSourceId = streamerMeta?.sourceId ?? streamerMeta?.id;
-    if (settings.plain.onlyWhenStreamingScreen && currentSourceId && !currentSourceId.startsWith("screen:")) {
-        return;
-    }
+        const streamerMeta = ApplicationStreamingStore.getStreamerActiveStreamMetadata();
+        const currentSourceId = streamerMeta?.sourceId ?? streamerMeta?.id;
+        if (settings.plain.onlyWhenStreamingScreen && currentSourceId && !currentSourceId.startsWith("screen:")) {
+            return;
+        }
 
-    if (!currentTargetSourceId && currentSourceId) {
-        currentTargetSourceId = currentSourceId;
-    }
+        const now = Date.now();
 
-    const active = await Native.getActiveScreenSource(settings.plain.invertScreens);
-    if (!active) return;
+        if (currentSourceId && currentSourceId.startsWith("screen:") && now - lastSwapTime > MIN_SWAP_COOLDOWN) {
+            if (!currentTargetSourceId || (currentTargetSourceId !== currentSourceId && !pendingSourceId)) {
+                currentTargetSourceId = currentSourceId;
+            }
+        }
 
-    if (active.sourceId === currentTargetSourceId) {
+        const active = await Native.getActiveScreenSource(settings.plain.invertScreens);
+
+        if (pollInterval === undefined || !settings.plain.autoSwitch) {
+            return;
+        }
+
+        if (!active) {
+            pendingSourceId = null;
+            pendingSourceName = null;
+            dwellStartTime = 0;
+            return;
+        }
+
+        if (!currentTargetSourceId) {
+            currentTargetSourceId = currentSourceId || active.sourceId;
+        }
+
+        if (active.sourceId === currentTargetSourceId) {
+            pendingSourceId = null;
+            pendingSourceName = null;
+            dwellStartTime = 0;
+            return;
+        }
+
+        if (pendingSourceId !== active.sourceId) {
+            pendingSourceId = active.sourceId;
+            pendingSourceName = active.sourceName;
+            dwellStartTime = now;
+            return;
+        }
+
+        if (now - dwellStartTime < settings.plain.delay) {
+            return;
+        }
+
+        if (now - lastSwapTime < MIN_SWAP_COOLDOWN) {
+            return;
+        }
+
+        lastSwapTime = now;
+        currentTargetSourceId = active.sourceId;
         pendingSourceId = null;
         pendingSourceName = null;
         dwellStartTime = 0;
-        return;
+
+        switchSource(active.sourceId, active.sourceName);
+    } catch {
+        // Prevent unhandled errors from breaking the polling loop
+    } finally {
+        isTicking = false;
     }
-
-    const now = Date.now();
-
-    if (pendingSourceId !== active.sourceId) {
-        pendingSourceId = active.sourceId;
-        pendingSourceName = active.sourceName;
-        dwellStartTime = now;
-        return;
-    }
-
-    if (now - dwellStartTime < settings.plain.delay) {
-        return;
-    }
-
-    if (now - lastSwapTime < MIN_SWAP_COOLDOWN) {
-        return;
-    }
-
-    lastSwapTime = now;
-    currentTargetSourceId = active.sourceId;
-    pendingSourceId = null;
-    pendingSourceName = null;
-    dwellStartTime = 0;
-
-    switchSource(active.sourceId, active.sourceName);
 }
 
 function switchSource(sourceId: string, sourceName: string) {
@@ -296,6 +321,7 @@ function stopPolling() {
     pendingSourceId = null;
     pendingSourceName = null;
     dwellStartTime = 0;
+    isTicking = false;
 }
 
 function ActiveScreenIcon({ enabled = true, className }: { enabled?: boolean; className?: string; }) {

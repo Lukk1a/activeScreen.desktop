@@ -7,6 +7,8 @@
 import { definePluginSettings } from "@api/Settings";
 import { UserAreaButton, UserAreaButtonFactory, UserAreaRenderProps } from "@api/UserArea";
 import { Button } from "@components/Button";
+import { EquicordDevs } from "@utils/constants";
+import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { findByCodeLazy } from "@webpack";
 import {
@@ -17,14 +19,12 @@ import {
     useState
 } from "@webpack/common";
 
+const logger = new Logger("ActiveScreen");
 const startStream = findByCodeLazy('type:"STREAM_START"');
-
-const BUTTON_SETTINGS_KEYS: ("showButton" | "autoSwitch")[] = ["showButton", "autoSwitch"];
-const KEYBIND_SETTING_KEYS: ("shortcut")[] = ["shortcut"];
 const MIN_SWAP_COOLDOWN = 800;
 
 function KeybindRecorderSetting() {
-    const { shortcut } = settings.use(KEYBIND_SETTING_KEYS);
+    const { shortcut } = settings.use(["shortcut"]);
     const [recording, setRecording] = useState(false);
 
     useEffect(() => {
@@ -34,9 +34,7 @@ function KeybindRecorderSetting() {
             e.preventDefault();
             e.stopPropagation();
 
-            if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) {
-                return;
-            }
+            if (["Control", "Shift", "Alt", "Meta"].includes(e.key)) return;
 
             if (e.key === "Escape") {
                 setRecording(false);
@@ -73,7 +71,7 @@ function KeybindRecorderSetting() {
                 variant={recording ? "positive" : "secondary"}
                 onClick={() => setRecording(!recording)}
             >
-                {recording ? "Recording... Press keys (Esc to cancel)" : shortcut}
+                {recording ? "Recording... (Esc to cancel)" : shortcut}
             </Button>
             <Button
                 size="small"
@@ -107,7 +105,7 @@ const settings = definePluginSettings({
     },
     showToast: {
         type: OptionType.BOOLEAN,
-        description: "Show a toast notification when toggled.",
+        description: "Show a toast notification when toggled or switched.",
         default: true
     },
     delay: {
@@ -137,46 +135,35 @@ const settings = definePluginSettings({
 
 let pollInterval: number | undefined;
 let currentTargetSourceId: string | null = null;
-let lastSwappedSourceId: string | null = null;
 let pendingSourceId: string | null = null;
-let pendingSourceName: string | null = null;
 let dwellStartTime = 0;
 let lastSwapTime = 0;
-let toastTimeout: number | undefined;
 let isTicking = false;
-let lastAutoSwitch: boolean | undefined;
-let lastInvertScreens: boolean | undefined;
-let lastOnlyWhenStreamingScreen: boolean | undefined;
-let lastDelay: number | undefined;
 
 const Native = VencordNative.pluginHelpers.ActiveScreen as PluginNative<
     typeof import("./native")
 >;
 
+function resetState() {
+    currentTargetSourceId = null;
+    pendingSourceId = null;
+    dwellStartTime = 0;
+}
+
 function showToggleToast() {
     if (!settings.plain.showToast) return;
-
-    if (toastTimeout !== undefined) {
-        clearTimeout(toastTimeout);
-    }
-
-    toastTimeout = window.setTimeout(() => {
-        showToast({
-            text: settings.plain.autoSwitch ? "Active Screen resumed" : "Active Screen paused",
-            variant: settings.plain.autoSwitch ? "success" : "critical",
-            duration: 1500
-        });
-        toastTimeout = undefined;
-    }, 250);
+    showToast({
+        text: settings.plain.autoSwitch ? "Active Screen resumed" : "Active Screen paused",
+        variant: settings.plain.autoSwitch ? "success" : "critical",
+        duration: 1500
+    });
 }
 
 function toggle() {
     settings.store.autoSwitch = !settings.store.autoSwitch;
     showToggleToast();
     if (!settings.plain.autoSwitch) {
-        pendingSourceId = null;
-        pendingSourceName = null;
-        dwellStartTime = 0;
+        resetState();
     }
 }
 
@@ -193,18 +180,13 @@ function matchesShortcut(e: KeyboardEvent, shortcut: string): boolean {
 
     const key = e.key.toUpperCase();
     const code = e.code.toUpperCase();
-
     return key === mainKey || code === mainKey || (mainKey === "SPACE" && key === " ") || (mainKey === "ESC" && key === "ESCAPE");
 }
 
 function handleKeydown(e: KeyboardEvent) {
     if (e.repeat) return;
-    if (e.target instanceof HTMLInputElement ||
-        e.target instanceof HTMLTextAreaElement ||
-        (e.target as HTMLElement | null)?.isContentEditable ||
-        (e.target as HTMLElement | null)?.closest?.('input, textarea, [contenteditable="true"], [role="textbox"], [data-slate-editor]')) {
-        return;
-    }
+    const target = e.target as HTMLElement | null;
+    if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
 
     if (matchesShortcut(e, settings.plain.shortcut)) {
         e.preventDefault();
@@ -213,30 +195,15 @@ function handleKeydown(e: KeyboardEvent) {
 }
 
 async function tick() {
-    if (settings.plain.autoSwitch !== lastAutoSwitch ||
-        settings.plain.invertScreens !== lastInvertScreens ||
-        settings.plain.onlyWhenStreamingScreen !== lastOnlyWhenStreamingScreen ||
-        settings.plain.delay !== lastDelay) {
-        lastAutoSwitch = settings.plain.autoSwitch;
-        lastInvertScreens = settings.plain.invertScreens;
-        lastOnlyWhenStreamingScreen = settings.plain.onlyWhenStreamingScreen;
-        lastDelay = settings.plain.delay;
-        pendingSourceId = null;
-        pendingSourceName = null;
-        dwellStartTime = 0;
-    }
-
     if (!settings.plain.autoSwitch || isTicking) return;
     isTicking = true;
 
     try {
         const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
         if (!stream) {
-            currentTargetSourceId = null;
-            lastSwappedSourceId = null;
-            pendingSourceId = null;
-            pendingSourceName = null;
-            dwellStartTime = 0;
+            if (Date.now() - lastSwapTime > 2500) {
+                resetState();
+            }
             return;
         }
 
@@ -246,21 +213,12 @@ async function tick() {
         const isWindowShare = (streamerMeta?.pid != null && streamerMeta?.pid !== 0) || (Boolean(currentSourceId) && !isScreenShare);
 
         if (settings.plain.onlyWhenStreamingScreen && isWindowShare) {
-            pendingSourceId = null;
-            pendingSourceName = null;
-            dwellStartTime = 0;
-            currentTargetSourceId = null;
+            resetState();
             return;
         }
 
-        const now = Date.now();
-
-        if (lastSwappedSourceId && now - lastSwapTime > 2000) {
-            lastSwappedSourceId = null;
-        }
-
         const active = await Native?.getActiveScreenSource?.(settings.plain.invertScreens);
-        if (!active || !active.sourceId) return;
+        if (!active?.sourceId) return;
 
         if (!currentTargetSourceId) {
             currentTargetSourceId = (isScreenShare && currentSourceId) ? currentSourceId : active.sourceId;
@@ -268,37 +226,29 @@ async function tick() {
 
         if (active.sourceId === currentTargetSourceId) {
             pendingSourceId = null;
-            pendingSourceName = null;
             dwellStartTime = 0;
             return;
         }
 
+        const now = Date.now();
         if (pendingSourceId !== active.sourceId) {
             pendingSourceId = active.sourceId;
-            pendingSourceName = active.sourceName;
             dwellStartTime = now;
             return;
         }
 
         const delay = settings.plain.delay ?? 500;
-        if (now - dwellStartTime < delay) {
-            return;
-        }
-
-        if (now - lastSwapTime < MIN_SWAP_COOLDOWN) {
-            return;
-        }
+        if (now - dwellStartTime < delay) return;
+        if (now - lastSwapTime < MIN_SWAP_COOLDOWN) return;
 
         lastSwapTime = now;
-        lastSwappedSourceId = active.sourceId;
         currentTargetSourceId = active.sourceId;
         pendingSourceId = null;
-        pendingSourceName = null;
         dwellStartTime = 0;
 
         switchSource(active.sourceId, active.sourceName);
     } catch (e) {
-        console.error("[ActiveScreen] Error in tick:", e);
+        logger.error("Error in tick:", e);
     } finally {
         isTicking = false;
     }
@@ -307,7 +257,7 @@ async function tick() {
 function switchSource(sourceId: string, sourceName: string) {
     try {
         if (typeof startStream !== "function") {
-            console.error("[ActiveScreen] startStream is not available");
+            logger.error("startStream is not available");
             return;
         }
 
@@ -319,7 +269,7 @@ function switchSource(sourceId: string, sourceName: string) {
         const sound = state.soundshareEnabled ?? true;
         const previewDisabled = streamerMeta?.previewDisabled ?? false;
 
-        console.info(`[ActiveScreen] Switching stream to ${sourceName} (${sourceId})`);
+        logger.info(`Switching stream to ${sourceName} (${sourceId})`);
 
         startStream(stream.guildId ?? null, stream.channelId, {
             pid: null,
@@ -338,7 +288,7 @@ function switchSource(sourceId: string, sourceName: string) {
             });
         }
     } catch (e) {
-        console.error("[ActiveScreen] Error switching stream:", e);
+        logger.error("Error switching stream:", e);
     }
 }
 
@@ -352,18 +302,11 @@ function stopPolling() {
         clearInterval(pollInterval);
         pollInterval = undefined;
     }
-    currentTargetSourceId = null;
-    lastSwappedSourceId = null;
-    pendingSourceId = null;
-    pendingSourceName = null;
-    dwellStartTime = 0;
+    resetState();
     isTicking = false;
 }
 
 function ActiveScreenIcon({ enabled = true, className }: { enabled?: boolean; className?: string; }) {
-    const redLinePath = "M22.7 2.7a1 1 0 0 0-1.4-1.4l-20 20a1 1 0 1 0 1.4 1.4Z";
-    const maskBlackPath = "M23.27 4.73 19.27 .73 -.27 20.27 3.73 24.27Z";
-
     return (
         <svg
             className={className}
@@ -378,10 +321,10 @@ function ActiveScreenIcon({ enabled = true, className }: { enabled?: boolean; cl
             />
             {!enabled && (
                 <>
-                    <path fill="var(--status-danger)" d={redLinePath} />
+                    <path fill="var(--status-danger)" d="M22.7 2.7a1 1 0 0 0-1.4-1.4l-20 20a1 1 0 1 0 1.4 1.4Z" />
                     <mask id="activescreenmask">
                         <rect fill="white" x="0" y="0" width="24" height="24" />
-                        <path fill="black" d={maskBlackPath} />
+                        <path fill="black" d="M23.27 4.73 19.27 .73 -.27 20.27 3.73 24.27Z" />
                     </mask>
                 </>
             )}
@@ -390,8 +333,7 @@ function ActiveScreenIcon({ enabled = true, className }: { enabled?: boolean; cl
 }
 
 function ActiveScreenButton(props: UserAreaRenderProps) {
-    const { showButton, autoSwitch } = settings.use(BUTTON_SETTINGS_KEYS);
-
+    const { showButton, autoSwitch } = settings.use(["showButton", "autoSwitch"]);
     if (!showButton) return null;
 
     return (
@@ -413,10 +355,8 @@ export default definePlugin({
     name: "ActiveScreen",
     description: "Automatically switches your screen share to the monitor containing your cursor.",
     tags: ["Media", "Voice", "Utility"],
-    authors: [{
-        name: "l1uka1",
-        id: 998585779804708864n
-    }],
+    authors: [EquicordDevs.l1uka1],
+    dependencies: ["UserAreaAPI"],
     settings,
 
     userAreaButton: {
@@ -425,51 +365,18 @@ export default definePlugin({
     },
 
     start() {
-        lastAutoSwitch = settings.plain.autoSwitch;
-        lastInvertScreens = settings.plain.invertScreens;
-        lastOnlyWhenStreamingScreen = settings.plain.onlyWhenStreamingScreen;
-        lastDelay = settings.plain.delay;
         window.addEventListener("keydown", handleKeydown);
         startPolling();
     },
 
     stop() {
         window.removeEventListener("keydown", handleKeydown);
-        if (toastTimeout !== undefined) {
-            clearTimeout(toastTimeout);
-            toastTimeout = undefined;
-        }
         stopPolling();
     },
 
     flux: {
-        STREAM_CREATE() {
-            currentTargetSourceId = null;
-            lastSwappedSourceId = null;
-            pendingSourceId = null;
-            dwellStartTime = 0;
-        },
-        STREAM_DELETE() {
-            if (Date.now() - lastSwapTime < 2500) return;
-            currentTargetSourceId = null;
-            lastSwappedSourceId = null;
-            pendingSourceId = null;
-            dwellStartTime = 0;
-        },
-        STREAM_STOP() {
-            if (Date.now() - lastSwapTime < 2500) return;
-            currentTargetSourceId = null;
-            lastSwappedSourceId = null;
-            pendingSourceId = null;
-            dwellStartTime = 0;
-        },
-        VOICE_CHANNEL_SELECT(d: { channelId: string | null }) {
-            if (!d.channelId) {
-                currentTargetSourceId = null;
-                lastSwappedSourceId = null;
-                pendingSourceId = null;
-                dwellStartTime = 0;
-            }
+        VOICE_CHANNEL_SELECT({ channelId }: { channelId: string | null; }) {
+            if (!channelId) resetState();
         }
     }
 });

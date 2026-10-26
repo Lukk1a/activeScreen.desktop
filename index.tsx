@@ -150,10 +150,10 @@ let isTicking = false;
 let noStreamTicks = 0;
 let nullActiveTicks = 0;
 let pollSession = 0;
-let lastAutoSwitch = settings.plain.autoSwitch;
-let lastInvertScreens = settings.plain.invertScreens;
-let lastOnlyWhenStreamingScreen = settings.plain.onlyWhenStreamingScreen;
-let lastDelay = settings.plain.delay;
+let lastAutoSwitch: boolean | undefined;
+let lastInvertScreens: boolean | undefined;
+let lastOnlyWhenStreamingScreen: boolean | undefined;
+let lastDelay: number | undefined;
 
 const Native = VencordNative.pluginHelpers.ActiveScreen as PluginNative<
     typeof import("./native")
@@ -479,6 +479,10 @@ export default definePlugin({
     },
 
     start() {
+        lastAutoSwitch = settings.plain.autoSwitch;
+        lastInvertScreens = settings.plain.invertScreens;
+        lastOnlyWhenStreamingScreen = settings.plain.onlyWhenStreamingScreen;
+        lastDelay = settings.plain.delay;
         window.addEventListener("keydown", handleKeydown);
         if (ApplicationStreamingStore?.getCurrentUserActiveStream?.()) {
             startPolling();

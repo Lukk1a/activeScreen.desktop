@@ -7,6 +7,7 @@
 import { definePluginSettings } from "@api/Settings";
 import { UserAreaButton, UserAreaButtonFactory, UserAreaRenderProps } from "@api/UserArea";
 import { Button } from "@components/Button";
+import { Flex } from "@components/Flex";
 import { EquicordDevs } from "@utils/constants";
 import { Logger } from "@utils/Logger";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
@@ -65,7 +66,7 @@ function KeybindRecorderSetting() {
     }, [recording]);
 
     return (
-        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+        <Flex gap="8px" alignItems="center">
             <Button
                 size="small"
                 variant={recording ? "positive" : "secondary"}
@@ -77,13 +78,13 @@ function KeybindRecorderSetting() {
                 size="small"
                 variant="dangerSecondary"
                 onClick={() => {
-                    settings.store.shortcut = "CTRL+SHIFT+S";
+                    settings.store.shortcut = settings.def.shortcut.default ?? "CTRL+SHIFT+S";
                     setRecording(false);
                 }}
             >
                 Reset
             </Button>
-        </div>
+        </Flex>
     );
 }
 
@@ -150,24 +151,22 @@ function resetState() {
     dwellStartTime = 0;
 }
 
-function showToggleToast() {
-    if (!settings.plain.showToast) return;
-    showToast({
-        text: settings.plain.autoSwitch ? "Active Screen resumed" : "Active Screen paused",
-        variant: settings.plain.autoSwitch ? "success" : "critical",
-        duration: 1500
-    });
-}
-
 function toggle() {
-    settings.store.autoSwitch = !settings.store.autoSwitch;
-    showToggleToast();
-    if (!settings.plain.autoSwitch) {
-        resetState();
+    const next = !settings.plain.autoSwitch;
+    settings.store.autoSwitch = next;
+    if (!next) resetState();
+
+    if (settings.plain.showToast) {
+        showToast({
+            text: next ? "Active Screen resumed" : "Active Screen paused",
+            variant: next ? "success" : "critical",
+            duration: 1500
+        });
     }
 }
 
 function matchesShortcut(e: KeyboardEvent, shortcut: string): boolean {
+    if (!shortcut) return false;
     const parts = shortcut.toUpperCase().split("+").map(p => p.trim());
     const needCtrl = parts.includes("CTRL");
     const needShift = parts.includes("SHIFT");
@@ -185,7 +184,7 @@ function matchesShortcut(e: KeyboardEvent, shortcut: string): boolean {
 
 function handleKeydown(e: KeyboardEvent) {
     if (e.repeat) return;
-    const target = e.target as HTMLElement | null;
+    const target = e.target instanceof HTMLElement ? e.target : null;
     if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
 
     if (matchesShortcut(e, settings.plain.shortcut)) {
@@ -375,6 +374,7 @@ export default definePlugin({
     },
 
     flux: {
+        STREAM_CREATE: resetState,
         VOICE_CHANNEL_SELECT({ channelId }: { channelId: string | null; }) {
             if (!channelId) resetState();
         }

@@ -6,7 +6,6 @@
 
 import { definePluginSettings } from "@api/Settings";
 import { UserAreaButton, UserAreaButtonFactory, UserAreaRenderProps } from "@api/UserArea";
-import { getUserSettingLazy } from "@api/UserSettings";
 import { Button } from "@components/Button";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { findByCodeLazy } from "@webpack";
@@ -19,7 +18,6 @@ import {
 } from "@webpack/common";
 
 const startStream = findByCodeLazy('type:"STREAM_START"');
-const StreamPreviewSettings = getUserSettingLazy("voiceAndVideo", "disableStreamPreviews");
 
 const BUTTON_SETTINGS_KEYS: ("showButton" | "autoSwitch")[] = ["showButton", "autoSwitch"];
 const KEYBIND_SETTING_KEYS: ("shortcut")[] = ["shortcut"];
@@ -243,7 +241,9 @@ async function tick() {
         }
 
         const streamerMeta = ApplicationStreamingStore?.getStreamerActiveStreamMetadata?.();
-        const isWindowShare = streamerMeta?.pid != null && streamerMeta?.pid !== 0;
+        const currentSourceId = streamerMeta?.sourceId ?? streamerMeta?.id;
+        const isScreenShare = Boolean(currentSourceId && currentSourceId.startsWith("screen:"));
+        const isWindowShare = (streamerMeta?.pid != null && streamerMeta?.pid !== 0) || (Boolean(currentSourceId) && !isScreenShare);
 
         if (settings.plain.onlyWhenStreamingScreen && isWindowShare) {
             pendingSourceId = null;
@@ -263,10 +263,7 @@ async function tick() {
         if (!active || !active.sourceId) return;
 
         if (!currentTargetSourceId) {
-            const currentSourceId = streamerMeta?.sourceId ?? streamerMeta?.id;
-            currentTargetSourceId = (currentSourceId && currentSourceId.startsWith("screen:"))
-                ? currentSourceId
-                : active.sourceId;
+            currentTargetSourceId = (isScreenShare && currentSourceId) ? currentSourceId : active.sourceId;
         }
 
         if (active.sourceId === currentTargetSourceId) {
@@ -320,7 +317,7 @@ function switchSource(sourceId: string, sourceName: string) {
         const streamerMeta = ApplicationStreamingStore?.getStreamerActiveStreamMetadata?.();
         const state = ApplicationStreamingSettingsStore?.getState?.() ?? {};
         const sound = state.soundshareEnabled ?? true;
-        const previewDisabled = streamerMeta?.previewDisabled ?? StreamPreviewSettings?.getSetting?.() ?? false;
+        const previewDisabled = streamerMeta?.previewDisabled ?? false;
 
         console.info(`[ActiveScreen] Switching stream to ${sourceName} (${sourceId})`);
 

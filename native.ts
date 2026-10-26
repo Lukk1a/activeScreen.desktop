@@ -137,10 +137,13 @@ export async function getActiveScreenSource(_: IpcMainInvokeEvent, invert = fals
                             return m ? parseInt(m[1], 10) === 2 : false;
                         }) ?? sources[1];
             } else {
-                const sortedDisplays = [...displays].sort((a, b) => (a.bounds.x !== b.bounds.x ? a.bounds.x - b.bounds.x : a.bounds.y - b.bounds.y));
-                const displayIndex = sortedDisplays.findIndex(d => d.id === display.id);
-                if (displayIndex >= 0 && displayIndex < sources.length) {
-                    match = sources[displayIndex];
+                const nonPrimaryDisplays = displays
+                    .filter(d => d.id !== primaryDisplay.id && !(d.bounds.x === 0 && d.bounds.y === 0))
+                    .sort((a, b) => (a.bounds.x !== b.bounds.x ? a.bounds.x - b.bounds.x : a.bounds.y - b.bounds.y));
+                const nonPrimaryIdx = nonPrimaryDisplays.findIndex(d => d.id === display.id);
+                const secondarySources = sources.filter(s => s.id !== "screen:0:0" && s.id !== "screen:0" && !s.name.match(/\b1\b/));
+                if (nonPrimaryIdx >= 0 && nonPrimaryIdx < secondarySources.length) {
+                    match = secondarySources[nonPrimaryIdx];
                 }
             }
         }

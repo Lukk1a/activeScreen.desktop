@@ -27,11 +27,13 @@ Then reload Discord (`Ctrl+R`).
 ## Settings
 
 - **autoSwitch:** Enable or disable automatic screen switching.
-- **showButton:** Show toggle button next to mute/deafen.
-- **showToast:** Show notifications when toggled.
-- **delay:** Dwell time before switching screens (default: 1000ms).
-- **onlyWhenStreamingScreen:** Only switch when sharing a full display.
-- **shortcut:** Customizable shortcut to toggle the plugin.
+- **invertScreens:** Invert screen mapping (swap which screen is selected).
+- **showButton:** Show toggle button next to mute/deafen in the user panel.
+- **showToast:** Show notifications when toggled or when screens are switched.
+- **delay:** Dwell time before switching screens (default: 500ms).
+- **onlyWhenStreamingScreen:** Only switch when sharing a full display rather than a specific window.
+- **shortcut:** Customizable shortcut to toggle the plugin (default: `CTRL+SHIFT+S`).
+
 ## License
 
 GPL-3.0-or-later

@@ -15,7 +15,6 @@ import {
     ApplicationStreamingStore,
     showToast,
     useEffect,
-    UserStore,
     useState
 } from "@webpack/common";
 
@@ -117,7 +116,7 @@ const settings = definePluginSettings({
         type: OptionType.SLIDER,
         description: "Dwell time before switching screens in milliseconds.",
         markers: [250, 500, 750, 1000, 1500, 2000, 3000],
-        default: 600,
+        default: 500,
         stickToMarkers: false
     },
     onlyWhenStreamingScreen: {
@@ -147,9 +146,6 @@ let dwellStartTime = 0;
 let lastSwapTime = 0;
 let toastTimeout: number | undefined;
 let isTicking = false;
-let noStreamTicks = 0;
-let nullActiveTicks = 0;
-let pollSession = 0;
 let lastAutoSwitch: boolean | undefined;
 let lastInvertScreens: boolean | undefined;
 let lastOnlyWhenStreamingScreen: boolean | undefined;
@@ -219,7 +215,6 @@ function handleKeydown(e: KeyboardEvent) {
 }
 
 async function tick() {
-    // If settings changed while polling, immediately align state to prevent stale dwell or desync
     if (settings.plain.autoSwitch !== lastAutoSwitch ||
         settings.plain.invertScreens !== lastInvertScreens ||
         settings.plain.onlyWhenStreamingScreen !== lastOnlyWhenStreamingScreen ||
@@ -235,7 +230,6 @@ async function tick() {
 
     if (!settings.plain.autoSwitch || isTicking) return;
     isTicking = true;
-    const currentSession = pollSession;
 
     try {
         const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
@@ -245,82 +239,36 @@ async function tick() {
             pendingSourceId = null;
             pendingSourceName = null;
             dwellStartTime = 0;
-            noStreamTicks++;
-            if (noStreamTicks >= 10) {
-                stopPolling();
-            }
             return;
         }
-        noStreamTicks = 0;
 
         const streamerMeta = ApplicationStreamingStore?.getStreamerActiveStreamMetadata?.();
-        const currentSourceId = streamerMeta?.sourceId ?? streamerMeta?.id;
-        const isScreenStream = Boolean(
-            currentSourceId?.startsWith("screen:") &&
-            (streamerMeta?.pid == null || streamerMeta?.pid === 0)
-        );
+        const isWindowShare = streamerMeta?.pid != null && streamerMeta?.pid !== 0;
 
-        if (!isScreenStream) {
-            // When not actively sharing a full screen display (window share, game share, webcam),
-            // reset pending dwell and never hijack or corrupt the stream
+        if (settings.plain.onlyWhenStreamingScreen && isWindowShare) {
             pendingSourceId = null;
             pendingSourceName = null;
             dwellStartTime = 0;
             currentTargetSourceId = null;
-            lastSwappedSourceId = null;
-            if (settings.plain.onlyWhenStreamingScreen || !currentSourceId) {
-                return;
-            }
+            return;
         }
 
         const now = Date.now();
 
-        // Expire lastSwappedSourceId once WebRTC swap cooldown has stabilized (> 2000ms)
         if (lastSwappedSourceId && now - lastSwapTime > 2000) {
             lastSwappedSourceId = null;
         }
 
-        // Synchronize external changes made directly in Discord's UI:
-        // Discord's WebRTC stream renegotiation takes 500-1500ms to update metadata after a swap.
-        // Therefore, we only accept an external source change if we have no active target yet,
-        // or after stream has stabilized (> 2000ms after last swap) where Discord reports
-        // a source that is neither our current target nor the source we just swapped to.
-        if (currentSourceId && currentSourceId.startsWith("screen:")) {
-            if (!currentTargetSourceId) {
-                currentTargetSourceId = currentSourceId;
-            } else if (now - lastSwapTime > 2000 &&
-                       currentSourceId !== currentTargetSourceId &&
-                       !pendingSourceId) {
-                currentTargetSourceId = currentSourceId;
-            }
-        }
-
-        if (!Native?.getActiveScreenSource) return;
-        const active = await Native.getActiveScreenSource(settings.plain.invertScreens);
-
-        // Guard against race conditions if polling was stopped or restarted while awaiting native call
-        if (pollSession !== currentSession || pollInterval === undefined || !settings.plain.autoSwitch) {
-            return;
-        }
-
-        if (!active) {
-            nullActiveTicks++;
-            if (nullActiveTicks >= 2) {
-                pendingSourceId = null;
-                pendingSourceName = null;
-                dwellStartTime = 0;
-            }
-            return;
-        }
-        nullActiveTicks = 0;
+        const active = await Native?.getActiveScreenSource?.(settings.plain.invertScreens);
+        if (!active || !active.sourceId) return;
 
         if (!currentTargetSourceId) {
+            const currentSourceId = streamerMeta?.sourceId ?? streamerMeta?.id;
             currentTargetSourceId = (currentSourceId && currentSourceId.startsWith("screen:"))
                 ? currentSourceId
                 : active.sourceId;
         }
 
-        // If cursor is already on the screen being streamed, reset pending dwell
         if (active.sourceId === currentTargetSourceId) {
             pendingSourceId = null;
             pendingSourceName = null;
@@ -328,7 +276,6 @@ async function tick() {
             return;
         }
 
-        // Cursor moved to a new screen
         if (pendingSourceId !== active.sourceId) {
             pendingSourceId = active.sourceId;
             pendingSourceName = active.sourceName;
@@ -336,12 +283,11 @@ async function tick() {
             return;
         }
 
-        // Check if dwell time threshold is reached
-        if (now - dwellStartTime < settings.plain.delay) {
+        const delay = settings.plain.delay ?? 500;
+        if (now - dwellStartTime < delay) {
             return;
         }
 
-        // Check swap cooldown
         if (now - lastSwapTime < MIN_SWAP_COOLDOWN) {
             return;
         }
@@ -354,8 +300,8 @@ async function tick() {
         dwellStartTime = 0;
 
         switchSource(active.sourceId, active.sourceName);
-    } catch {
-        // Prevent unhandled errors from breaking the polling loop
+    } catch (e) {
+        console.error("[ActiveScreen] Error in tick:", e);
     } finally {
         isTicking = false;
     }
@@ -363,7 +309,10 @@ async function tick() {
 
 function switchSource(sourceId: string, sourceName: string) {
     try {
-        if (typeof startStream !== "function") return;
+        if (typeof startStream !== "function") {
+            console.error("[ActiveScreen] startStream is not available");
+            return;
+        }
 
         const stream = ApplicationStreamingStore?.getCurrentUserActiveStream?.();
         if (!stream) return;
@@ -371,9 +320,9 @@ function switchSource(sourceId: string, sourceName: string) {
         const streamerMeta = ApplicationStreamingStore?.getStreamerActiveStreamMetadata?.();
         const state = ApplicationStreamingSettingsStore?.getState?.() ?? {};
         const sound = state.soundshareEnabled ?? true;
-        const resolution = state.resolution ?? 720;
-        const fps = state.fps ?? 30;
         const previewDisabled = streamerMeta?.previewDisabled ?? StreamPreviewSettings?.getSetting?.() ?? false;
+
+        console.info(`[ActiveScreen] Switching stream to ${sourceName} (${sourceId})`);
 
         startStream(stream.guildId ?? null, stream.channelId, {
             pid: null,
@@ -381,25 +330,27 @@ function switchSource(sourceId: string, sourceName: string) {
             sourceName,
             audioSourceId: null,
             sound,
-            previewDisabled,
-            resolution,
-            fps
+            previewDisabled
         });
-    } catch {
-        // Prevent stream swap exceptions from crashing
+
+        if (settings.plain.showToast) {
+            showToast({
+                text: `Switched stream to ${sourceName}`,
+                variant: "success",
+                duration: 1200
+            });
+        }
+    } catch (e) {
+        console.error("[ActiveScreen] Error switching stream:", e);
     }
 }
 
 function startPolling() {
-    noStreamTicks = 0;
-    nullActiveTicks = 0;
-    pollSession++;
     if (pollInterval !== undefined) return;
     pollInterval = window.setInterval(tick, 200);
 }
 
 function stopPolling() {
-    pollSession++;
     if (pollInterval !== undefined) {
         clearInterval(pollInterval);
         pollInterval = undefined;
@@ -410,8 +361,6 @@ function stopPolling() {
     pendingSourceName = null;
     dwellStartTime = 0;
     isTicking = false;
-    noStreamTicks = 0;
-    nullActiveTicks = 0;
 }
 
 function ActiveScreenIcon({ enabled = true, className }: { enabled?: boolean; className?: string; }) {
@@ -484,9 +433,7 @@ export default definePlugin({
         lastOnlyWhenStreamingScreen = settings.plain.onlyWhenStreamingScreen;
         lastDelay = settings.plain.delay;
         window.addEventListener("keydown", handleKeydown);
-        if (ApplicationStreamingStore?.getCurrentUserActiveStream?.()) {
-            startPolling();
-        }
+        startPolling();
     },
 
     stop() {
@@ -499,29 +446,32 @@ export default definePlugin({
     },
 
     flux: {
-        STREAM_CREATE(d: { streamKey: string }) {
-            const userId = UserStore?.getCurrentUser?.()?.id;
-            if (!d.streamKey || (userId && d.streamKey.endsWith(userId))) {
-                startPolling();
-            }
+        STREAM_CREATE() {
+            currentTargetSourceId = null;
+            lastSwappedSourceId = null;
+            pendingSourceId = null;
+            dwellStartTime = 0;
         },
-        STREAM_DELETE(d: { streamKey: string }) {
-            const userId = UserStore?.getCurrentUser?.()?.id;
-            if (!d.streamKey || (userId && d.streamKey.endsWith(userId))) {
-                if (Date.now() - lastSwapTime < 2500) return;
-                stopPolling();
-            }
+        STREAM_DELETE() {
+            if (Date.now() - lastSwapTime < 2500) return;
+            currentTargetSourceId = null;
+            lastSwappedSourceId = null;
+            pendingSourceId = null;
+            dwellStartTime = 0;
         },
-        STREAM_STOP(d: { streamKey?: string }) {
-            const userId = UserStore?.getCurrentUser?.()?.id;
-            if (!d.streamKey || (userId && d.streamKey.endsWith(userId))) {
-                if (Date.now() - lastSwapTime < 2500) return;
-                stopPolling();
-            }
+        STREAM_STOP() {
+            if (Date.now() - lastSwapTime < 2500) return;
+            currentTargetSourceId = null;
+            lastSwappedSourceId = null;
+            pendingSourceId = null;
+            dwellStartTime = 0;
         },
         VOICE_CHANNEL_SELECT(d: { channelId: string | null }) {
             if (!d.channelId) {
-                stopPolling();
+                currentTargetSourceId = null;
+                lastSwappedSourceId = null;
+                pendingSourceId = null;
+                dwellStartTime = 0;
             }
         }
     }
